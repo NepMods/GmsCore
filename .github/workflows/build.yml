@@ -68,6 +68,43 @@ jobs:
           echo "Looking for APK outputs..."
           find . -iname '*.apk' -path '*/outputs/*' | sort
 
+      - name: "Decode signing keystore"
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "${RUNNER_TEMP}/release.keystore.jks"
+
+      - name: "Zipalign and sign release APKs"
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)"
+          ZIPALIGN="${BUILD_TOOLS}/zipalign"
+          APKSIGNER="${BUILD_TOOLS}/apksigner"
+
+          declare -A KEEP_PATHS=(
+            ["services"]="play-services-core/build/outputs/apk/hmsDefault/release/com.google.android.gms-252432000.apk"
+            ["companion"]="vending-app/build/outputs/apk/default/release/com.android.vending-84022600.apk"
+          )
+
+          for name in "${!KEEP_PATHS[@]}"; do
+            src="${KEEP_PATHS[$name]}"
+            aligned="${src%.apk}-aligned.apk"
+
+            "$ZIPALIGN" -v -p 4 "$src" "$aligned"
+            "$APKSIGNER" sign \
+              --ks "${RUNNER_TEMP}/release.keystore.jks" \
+              --ks-pass "pass:${KEYSTORE_PASSWORD}" \
+              --ks-key-alias "${KEY_ALIAS}" \
+              --out "$src" \
+              "$aligned"
+            rm -f "$aligned"
+
+            "$APKSIGNER" verify --print-certs "$src"
+          done
+
       - name: "Build release assets and manifest"
         run: |
           set -euo pipefail
@@ -77,8 +114,11 @@ jobs:
           AAPT="${BUILD_TOOLS}/aapt"
           APKSIGNER="${BUILD_TOOLS}/apksigner"
 
-          # --- Map packageName -> manifest metadata ---------------------
-          # Edit this table to match the modules your build produces.
+          # --- Fixed set of release APKs (flavor pinned to hmsDefault / default) -----
+          declare -A RELEASE_PATHS=(
+            ["services"]="play-services-core/build/outputs/apk/hmsDefault/release/com.google.android.gms-252432000.apk"
+            ["companion"]="vending-app/build/outputs/apk/default/release/com.android.vending-84022600.apk"
+          )
           declare -A ID_MAP=(
             ["com.google.android.gms"]="services"
             ["com.android.vending"]="companion"
@@ -91,13 +131,13 @@ jobs:
             ["com.google.android.gms"]=0
             ["com.android.vending"]=1
           )
-          # ----------------------------------------------------------------
+          # ----------------------------------------------------------------------------
 
           RUNTIME_VERSION="microg-$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
 
           echo "[]" > artifacts.json
 
-          find . -iname '*.apk' -path '*/outputs/*' ! -iname '*unsigned*' | while read -r apk; do
+          for apk in "${RELEASE_PATHS[@]}"; do
             PACKAGE_NAME=$("$AAPT" dump badging "$apk" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
             VERSION_CODE=$("$AAPT" dump badging "$apk" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")
 
