@@ -1,5 +1,7 @@
 name: "Gradle build"
-permissions: {}
+permissions:
+  contents: write
+
 on:
   - push
   - pull_request
@@ -19,21 +21,21 @@ jobs:
     steps:
       - name: "Free disk space"
         run: |
-          # Deleting unneeded software packages
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo rm -rf /opt/hostedtoolcache/go
-
-          # Log available space
           df -h
+
       - name: "Checkout sources"
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
       - name: "Setup Java"
         uses: actions/setup-java@v6
         with:
           distribution: "temurin"
           java-version: "17"
+
       - name: "Setup Gradle"
         uses: gradle/actions/setup-gradle@v6
         with:
@@ -41,10 +43,9 @@ jobs:
           build-scan-publish: true
           build-scan-terms-of-use-url: "https://gradle.com/help/legal-terms-of-use"
           build-scan-terms-of-use-agree: "yes"
+
       - name: "Setup matchers"
         run: |
-          # Setting up matchers...
-
           matchers_dir='${{ github.workspace }}/.github/matchers'
           matcher_list()
           {
@@ -58,7 +59,134 @@ jobs:
               echo "Matcher configured: ${NAME:?}"
             fi
           done
+
       - name: "Execute Gradle assemble"
         run: "./gradlew assemble${{ matrix.target }}"
+
       - name: "Execute Gradle lint"
         run: "./gradlew lint${{ matrix.target }}"
+
+      - name: "Upload APK artifacts"
+        if: matrix.target == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "apks-${{ matrix.target }}"
+          path: "**/build/outputs/apk/**/*.apk"
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: "Create release"
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: write
+
+    steps:
+      - name: "Checkout sources"
+        uses: actions/checkout@v7
+
+      - name: "Download release APKs"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "apks-Release"
+          path: "raw-apks"
+          merge-multiple: true
+
+      - name: "Determine version"
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/v}"
+          else
+            RAW_TAG="0.0.0.0"
+          fi
+          echo "tag=v${RAW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "runtime_version=microg-${RAW_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: "Build release assets and manifest"
+        id: manifest
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-assets
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)"
+          AAPT="${BUILD_TOOLS}/aapt"
+          APKSIGNER="${BUILD_TOOLS}/apksigner"
+
+          # --- Map packageName -> manifest metadata ---------------------
+          # Edit this table to match the modules your build produces.
+          declare -A ID_MAP=(
+            ["com.google.android.gms"]="services"
+            ["com.android.vending"]="companion"
+          )
+          declare -A NAME_MAP=(
+            ["com.google.android.gms"]="microG Services"
+            ["com.android.vending"]="microG Companion"
+          )
+          declare -A ORDER_MAP=(
+            ["com.google.android.gms"]=0
+            ["com.android.vending"]=1
+          )
+          # ----------------------------------------------------------------
+
+          TAG="${{ steps.version.outputs.tag }}"
+          RUNTIME_VERSION="${{ steps.version.outputs.runtime_version }}"
+
+          echo "[]" > artifacts.json
+
+          find raw-apks -name '*.apk' | while read -r apk; do
+            PACKAGE_NAME=$("$AAPT" dump badging "$apk" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+            VERSION_CODE=$("$AAPT" dump badging "$apk" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")
+
+            FILE_NAME="${PACKAGE_NAME}-${VERSION_CODE}.apk"
+            DEST="release-assets/${FILE_NAME}"
+            cp "$apk" "$DEST"
+
+            BYTES=$(stat -c%s "$DEST")
+            SHA256=$(sha256sum "$DEST" | awk '{print $1}')
+
+            SIGNER_SHA256=$("$APKSIGNER" verify --print-certs "$DEST" \
+              | awk -F': ' '/SHA-256 digest/{print $2; exit}' \
+              | tr 'A-F' 'a-f' | tr -d ':')
+
+            ID="${ID_MAP[$PACKAGE_NAME]:-$PACKAGE_NAME}"
+            DISPLAY_NAME="${NAME_MAP[$PACKAGE_NAME]:-$PACKAGE_NAME}"
+            INSTALL_ORDER="${ORDER_MAP[$PACKAGE_NAME]:-0}"
+
+            jq -n \
+              --arg id "$ID" \
+              --arg displayName "$DISPLAY_NAME" \
+              --arg fileName "$FILE_NAME" \
+              --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${FILE_NAME}" \
+              --argjson bytes "$BYTES" \
+              --arg sha256 "$SHA256" \
+              --arg packageName "$PACKAGE_NAME" \
+              --argjson versionCode "$VERSION_CODE" \
+              --arg signerSha256 "$SIGNER_SHA256" \
+              --argjson installOrder "$INSTALL_ORDER" \
+              '{id: $id, displayName: $displayName, fileName: $fileName, urls: [$url], bytes: $bytes, sha256: $sha256, packageName: $packageName, versionCode: $versionCode, signerSha256: $signerSha256, installOrder: $installOrder}' \
+              > entry.json
+
+            jq --slurpfile entry entry.json '. + $entry' artifacts.json > tmp.json && mv tmp.json artifacts.json
+          done
+
+          jq -n \
+            --argjson schemaVersion 1 \
+            --arg runtimeVersion "$RUNTIME_VERSION" \
+            --slurpfile artifacts <(jq 'sort_by(.installOrder)' artifacts.json) \
+            '{schemaVersion: $schemaVersion, runtimeVersion: $runtimeVersion, artifacts: $artifacts[0]}' \
+            > release-assets/manifest.json
+
+          cat release-assets/manifest.json
+
+      - name: "Create GitHub release"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.apk
+            release-assets/manifest.json
